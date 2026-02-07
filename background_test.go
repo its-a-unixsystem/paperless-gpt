@@ -116,7 +116,11 @@ type appStubBG struct {
 	tagCalls int
 }
 
-func (a *appStubBG) isOcrEnabled() bool { return true }
+func (a *appStubBG) isOcrEnabled() bool    { return true }
+func (a *appStubBG) isOneshotEnabled() bool { return false }
+func (a *appStubBG) processAutoOneshotDocuments(ctx context.Context) (int, error) {
+	return 0, nil
+}
 func (a *appStubBG) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 	a.ocrCalls++
 	// Return fixed count for background test

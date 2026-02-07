@@ -85,9 +85,7 @@ func (app *App) getSuggestedTags(
 	defer templateMutex.RUnlock()
 
 	// Remove all paperless-gpt related tags from available tags
-	availableTags = removeTagFromList(availableTags, manualTag)
-	availableTags = removeTagFromList(availableTags, autoTag)
-	availableTags = removeTagFromList(availableTags, autoOcrTag)
+	availableTags = removeSystemTagsFromList(availableTags)
 
 	// Get available tokens for content
 	templateData := map[string]interface{}{
@@ -150,18 +148,7 @@ func (app *App) getSuggestedTags(
 	slices.Sort(suggestedTags)
 	suggestedTags = slices.Compact(suggestedTags)
 
-	// Filter out tags that are not in the available tags list
-	filteredTags := []string{}
-	for _, tag := range suggestedTags {
-		for _, availableTag := range availableTags {
-			if strings.EqualFold(tag, availableTag) {
-				filteredTags = append(filteredTags, availableTag)
-				break
-			}
-		}
-	}
-
-	return filteredTags, nil
+	return filterTagsAgainstAvailable(suggestedTags, availableTags), nil
 }
 
 // getSuggestedDocumentType generates a suggested document type for a document using the LLM
@@ -526,6 +513,32 @@ func (app *App) generateDocumentSuggestions(ctx context.Context, suggestionReque
 			docLogger := documentLogger(documentID)
 			startTime := time.Now()
 			docLogger.Printf("Processing Document ID %d...", documentID)
+
+			// Oneshot mode: single multimodal call extracts all fields
+			if suggestionRequest.Oneshot {
+				docLogger.Infof("Oneshot mode: sending PDF directly to %s for OCR + field extraction in a single call", oneshotModel)
+				suggestion, oneshotErr := app.generateOneshotSuggestion(
+					ctx, doc, suggestionRequest,
+					availableTagNames, availableCorrespondentNames, availableDocumentTypeNames,
+				)
+				if oneshotErr != nil {
+					mu.Lock()
+					errorsList = append(errorsList, fmt.Errorf("Document %d (oneshot): %w", documentID, oneshotErr))
+					mu.Unlock()
+					docLogger.Errorf("Oneshot processing failed for document %d: %v", documentID, oneshotErr)
+					return
+				}
+
+				mu.Lock()
+				documentSuggestions = append(documentSuggestions, *suggestion)
+				mu.Unlock()
+
+				elapsed := time.Since(startTime)
+				runtime := time.Unix(0, elapsed.Nanoseconds()).UTC()
+				docLogger.Infof("Document %d processed successfully via oneshot (OCR + tagging in single call). Runtime: %s",
+					documentID, runtime.Format("15:04:05"))
+				return
+			}
 
 			content := doc.Content
 			suggestedTitle := doc.Title

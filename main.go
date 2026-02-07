@@ -78,6 +78,14 @@ var (
 	doclingImageExportMode        = os.Getenv("DOCLING_IMAGE_EXPORT_MODE")
 	doclingOCRPipeline            = os.Getenv("DOCLING_OCR_PIPELINE")
 	doclingOCREngine              = os.Getenv("DOCLING_OCR_ENGINE")
+	// Oneshot mode is currently implemented via the Google Gemini API (see app_llm_oneshot.go),
+	// so it always requires GOOGLEAI_API_KEY and a Gemini model name in ONESHOT_MODEL.
+	oneshotEnable        = os.Getenv("ONESHOT_ENABLE") == "true"
+	oneshotModel         = os.Getenv("ONESHOT_MODEL")
+	autoOneshotTag       = os.Getenv("AUTO_ONESHOT_TAG")
+	oneshotBackupModel   = os.Getenv("ONESHOT_BACKUP_MODEL")
+	oneshotErrorTag      = os.Getenv("ONESHOT_ERROR_TAG")
+	googleThinkingBudget *int32 // Will be parsed from GOOGLEAI_THINKING_BUDGET
 
 	// Templates
 	titleTemplate         *template.Template
@@ -88,6 +96,7 @@ var (
 	customFieldTemplate   *template.Template
 	ocrTemplate           *template.Template
 	adhocAnalysisTemplate *template.Template
+	oneshotTemplate       *template.Template
 	templateMutex         sync.RWMutex
 
 	// Server-side settings
@@ -246,6 +255,17 @@ func main() {
 		}
 	}
 
+	if val, ok := os.LookupEnv("GOOGLEAI_THINKING_BUDGET"); ok {
+		if v, err := strconv.ParseInt(val, 10, 32); err == nil {
+			if v >= math.MinInt32 && v <= math.MaxInt32 {
+				b := int32(v)
+				googleThinkingBudget = &b
+			}
+		} else {
+			log.Warnf("Invalid GOOGLEAI_THINKING_BUDGET value: %v, ignoring", err)
+		}
+	}
+
 	ocrConfig := ocr.Config{
 		Provider:                 providerType,
 		GoogleProjectID:          os.Getenv("GOOGLE_PROJECT_ID"),
@@ -269,6 +289,8 @@ func main() {
 		VisionLLMTemperature:     visionLlmTemperature,
 		OllamaOcrTopK:            ollamaOcrTopK,
 		OllamaContextLength:      ollamaContextLength,
+		GoogleAIAPIKey:           os.Getenv("GOOGLEAI_API_KEY"),
+		GoogleAIThinkingBudget:   googleThinkingBudget,
 	}
 
 	// Parse Azure timeout if set
@@ -291,7 +313,7 @@ func main() {
 
 		// Validate OCR provider and processing mode compatibility
 		log.Infof("Validating OCR provider '%s' with processing mode '%s'", providerType, ocrProcessMode)
-		if err := validateOCRProviderModeCompatibility(providerType, ocrProcessMode); err != nil {
+		if err := validateOCRProviderModeCompatibility(providerType, ocrProcessMode, visionLlmProvider); err != nil {
 			log.Fatalf("❌ Invalid OCR configuration: %v", err)
 		}
 		log.Infof("✅ OCR provider and processing mode configuration is valid")
@@ -507,14 +529,19 @@ func (app *App) isOcrEnabled() bool {
 }
 
 // validateOCRProviderModeCompatibility validates that the OCR provider supports the specified processing mode
-func validateOCRProviderModeCompatibility(provider, mode string) error {
+func validateOCRProviderModeCompatibility(provider, mode, visionProvider string) error {
 	// Define which providers support which modes
 	supportedModes := map[string][]string{
-		"llm":          {"image"},                     // LLM-based OCR only supports image mode
+		"llm":          {"image"},                     // LLM-based OCR only supports image mode (except googleai)
 		"azure":        {"image"},                     // Azure Document Intelligence only supports image mode
 		"google_docai": {"image", "pdf", "whole_pdf"}, // Google Document AI supports all modes
 		"mistral_ocr":  {"image", "pdf", "whole_pdf"}, // Mistral OCR supports all modes
 		"docling":      {"image", "pdf", "whole_pdf"}, // Docling supports image and PDF modes
+	}
+
+	// Google Gemini API natively handles PDF documents
+	if provider == "llm" && strings.ToLower(visionProvider) == "googleai" {
+		supportedModes["llm"] = []string{"image", "pdf", "whole_pdf"}
 	}
 
 	modes, exists := supportedModes[provider]
@@ -614,6 +641,46 @@ func validateOrDefaultEnvVars() {
 
 	if llmModel == "" {
 		log.Fatal("Please set the LLM_MODEL environment variable.")
+	}
+
+	// Oneshot mode configuration
+	if oneshotEnable {
+		if autoOneshotTag == "" {
+			autoOneshotTag = "paperless-gpt-oneshot"
+		}
+		if oneshotModel == "" {
+			if llmProvider != "googleai" {
+				log.Fatalf(
+					"ONESHOT_ENABLE is true but ONESHOT_MODEL is not set. Oneshot mode is Google-only (Gemini API) and cannot fall back to LLM_MODEL when LLM_PROVIDER=%s. "+
+						"Please set ONESHOT_MODEL to a Gemini model (and set GOOGLEAI_API_KEY), or disable ONESHOT_ENABLE.",
+					llmProvider,
+				)
+			}
+			oneshotModel = llmModel
+			log.Infof("ONESHOT_MODEL not set, falling back to LLM_MODEL (Google Gemini): %s", oneshotModel)
+		}
+		if !strings.Contains(strings.ToLower(oneshotModel), "gemini") {
+			log.Fatalf(
+				"ONESHOT_MODEL=%s does not look like a Google Gemini model. Oneshot mode is Google-only; please set ONESHOT_MODEL (and optionally ONESHOT_BACKUP_MODEL) to a Gemini model name.",
+				oneshotModel,
+			)
+		}
+		if oneshotBackupModel != "" && !strings.Contains(strings.ToLower(oneshotBackupModel), "gemini") {
+			log.Fatalf(
+				"ONESHOT_BACKUP_MODEL=%s does not look like a Google Gemini model. Oneshot mode is Google-only; please set ONESHOT_BACKUP_MODEL to a Gemini model name (or unset it).",
+				oneshotBackupModel,
+			)
+		}
+		if os.Getenv("GOOGLEAI_API_KEY") == "" {
+			log.Fatal("ONESHOT_ENABLE is true but GOOGLEAI_API_KEY is not set. Oneshot mode currently uses the Google Gemini API and requires GOOGLEAI_API_KEY.")
+		}
+		if oneshotErrorTag == "" {
+			oneshotErrorTag = "paperless-gpt-oneshot-error"
+		}
+		if oneshotBackupModel != "" {
+			log.Infof("Oneshot backup model: %s", oneshotBackupModel)
+		}
+		log.Infof("Oneshot mode enabled with model: %s, tag: %s, error tag: %s", oneshotModel, autoOneshotTag, oneshotErrorTag)
 	}
 
 	if llmProvider == "mistral" {
@@ -723,6 +790,17 @@ func removeTagFromList(tags []string, tagToRemove string) []string {
 	return filteredTags
 }
 
+// removeSystemTagsFromList removes internal paperless-gpt processing tags.
+func removeSystemTagsFromList(tags []string) []string {
+	filteredTags := tags
+	filteredTags = removeTagFromList(filteredTags, manualTag)
+	filteredTags = removeTagFromList(filteredTags, autoTag)
+	filteredTags = removeTagFromList(filteredTags, autoOcrTag)
+	filteredTags = removeTagFromList(filteredTags, autoOneshotTag)
+	filteredTags = removeTagFromList(filteredTags, oneshotErrorTag)
+	return filteredTags
+}
+
 // getLikelyLanguage determines the likely language of the document content
 func getLikelyLanguage() string {
 	likelyLanguage := os.Getenv("LLM_LANGUAGE")
@@ -811,6 +889,10 @@ func loadTemplates() error {
 		return err
 	}
 	adhocAnalysisTemplate, err = loadTemplate("adhoc-analysis_prompt.tmpl")
+	if err != nil {
+		return err
+	}
+	oneshotTemplate, err = loadTemplate("oneshot_prompt.tmpl")
 	if err != nil {
 		return err
 	}
@@ -934,16 +1016,7 @@ func createLLM() (llms.Model, error) {
 	case "googleai":
 		ctx := context.Background()
 		apiKey := os.Getenv("GOOGLEAI_API_KEY")
-		var thinkingBudget *int32
-		if val, ok := os.LookupEnv("GOOGLEAI_THINKING_BUDGET"); ok {
-			if v, err := strconv.ParseInt(val, 10, 32); err == nil {
-				if v >= math.MinInt32 && v <= math.MaxInt32 {
-					b := int32(v)
-					thinkingBudget = &b
-				}
-			}
-		}
-		provider, err := NewGoogleAIProvider(ctx, llmModel, apiKey, thinkingBudget)
+		provider, err := NewGoogleAIProvider(ctx, llmModel, apiKey, googleThinkingBudget)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create GoogleAI provider: %w", err)
 		}
@@ -1039,6 +1112,14 @@ func createVisionLLM() (llms.Model, error) {
 
 		// Apply rate limiting with isVision=true
 		return NewRateLimitedLLM(llm, getRateLimitConfig(true)), nil
+	case "googleai":
+		provider, err := ocr.NewGoogleAIProvider(context.Background(), visionLlmModel, os.Getenv("GOOGLEAI_API_KEY"), googleThinkingBudget)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create GoogleAI provider: %w", err)
+		}
+
+		// Apply rate limiting with isVision=true
+		return NewRateLimitedLLM(provider, getRateLimitConfig(true)), nil
 	case "anthropic":
 		apiKey := os.Getenv("ANTHROPIC_API_KEY")
 		if apiKey == "" {
