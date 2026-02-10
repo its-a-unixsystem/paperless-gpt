@@ -947,7 +947,10 @@ func (client *PaperlessClient) DownloadDocumentAsPDF(ctx context.Context, docume
 		return nil, nil, 0, err
 	}
 
-	// Get the number of pages in the PDF
+	// Try to parse page count with MuPDF. For split=false callers (e.g. oneshot),
+	// allow non-PDF originals such as images and continue with a fallback page count.
+	totalPages := 1
+
 	tmpFile, err := os.CreateTemp("", "document-*.pdf")
 	if err != nil {
 		return nil, nil, 0, err
@@ -962,11 +965,14 @@ func (client *PaperlessClient) DownloadDocumentAsPDF(ctx context.Context, docume
 
 	doc, err := fitz.New(tmpFile.Name())
 	if err != nil {
-		return nil, nil, 0, err
+		if !split {
+			return []string{}, pdfData, totalPages, nil
+		}
+		return nil, nil, 0, fmt.Errorf("error opening document %d for PDF splitting: %w", documentID, err)
 	}
 	defer doc.Close()
 
-	totalPages := doc.NumPage()
+	totalPages = doc.NumPage()
 	pagesToProcess := totalPages
 
 	if limitPages > 0 && limitPages < totalPages {

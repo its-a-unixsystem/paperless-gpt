@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gabriel-vasile/mimetype"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/genai"
 )
@@ -136,7 +137,7 @@ func findOneshotTextPart(parts []*genai.Part) (string, *genai.Part) {
 	return "", nil
 }
 
-func extractOneshotTextFromResponse(resp *genai.GenerateContentResponse, model string, pdfSizeBytes int, docLogger *logrus.Entry) (string, error) {
+func extractOneshotTextFromResponse(resp *genai.GenerateContentResponse, model string, inputSizeBytes int, docLogger *logrus.Entry) (string, error) {
 	var candidate *genai.Candidate
 	var firstPart *genai.Part
 	var textPart *genai.Part
@@ -180,22 +181,35 @@ func extractOneshotTextFromResponse(resp *genai.GenerateContentResponse, model s
 	}
 
 	partKind := oneshotPartKind(firstPart)
-	msg := fmt.Sprintf("oneshot LLM returned empty/non-text response (model=%s, pdf size=%d bytes, finishReason=%s, partKind=%s)", model, pdfSizeBytes, finishReason, partKind)
+	msg := fmt.Sprintf("oneshot LLM returned empty/non-text response (model=%s, input size=%d bytes, finishReason=%s, partKind=%s)", model, inputSizeBytes, finishReason, partKind)
 	if permanentFinishReasons[finishReason] {
 		return "", &permanentOneshotError{msg: msg}
 	}
 	return "", fmt.Errorf("%s", msg)
 }
 
-// callOneshotModel sends a PDF + prompt to the given model and returns the response text.
+func detectOneshotInputMIMEType(inputBytes []byte) (string, error) {
+	if len(inputBytes) == 0 {
+		return "", fmt.Errorf("oneshot input is empty")
+	}
+
+	detectedMIME := mimetype.Detect(inputBytes).String()
+	if detectedMIME == "application/pdf" || strings.HasPrefix(detectedMIME, "image/") {
+		return detectedMIME, nil
+	}
+
+	return "", fmt.Errorf("unsupported oneshot document MIME type: %s (expected application/pdf or image/*)", detectedMIME)
+}
+
+// callOneshotModel sends a document + prompt to the given model and returns the response text.
 // Returns a permanentOneshotError for non-retryable failures.
-func callOneshotModel(ctx context.Context, client *genai.Client, model string, pdfBytes []byte, prompt string, docLogger *logrus.Entry) (string, error) {
+func callOneshotModel(ctx context.Context, client *genai.Client, model string, mimeType string, inputBytes []byte, prompt string, docLogger *logrus.Entry) (string, error) {
 	resp, err := client.Models.GenerateContent(ctx, model, []*genai.Content{
 		{
 			Parts: []*genai.Part{
 				{InlineData: &genai.Blob{
-					MIMEType: "application/pdf",
-					Data:     pdfBytes,
+					MIMEType: mimeType,
+					Data:     inputBytes,
 				}},
 				{Text: prompt},
 			},
@@ -205,11 +219,11 @@ func callOneshotModel(ctx context.Context, client *genai.Client, model string, p
 	if err != nil {
 		return "", fmt.Errorf("oneshot LLM call failed (model=%s): %w", model, err)
 	}
-	return extractOneshotTextFromResponse(resp, model, len(pdfBytes), docLogger)
+	return extractOneshotTextFromResponse(resp, model, len(inputBytes), docLogger)
 }
 
 // generateOneshotSuggestion processes a single document using the oneshot multimodal approach.
-// It sends the raw PDF to Google AI Gemini along with a structured prompt, and parses the response.
+// It sends the raw document bytes (PDF or image) to Google AI Gemini along with a structured prompt, and parses the response.
 func (app *App) generateOneshotSuggestion(
 	ctx context.Context,
 	doc Document,
@@ -220,17 +234,23 @@ func (app *App) generateOneshotSuggestion(
 ) (*DocumentSuggestion, error) {
 	docLogger := documentLogger(doc.ID)
 
-	// Download document as PDF
-	docLogger.Info("Downloading document as PDF for oneshot processing")
-	_, pdfBytes, _, err := app.Client.DownloadDocumentAsPDF(ctx, doc.ID, limitOcrPages, false)
+	// Download document in its original format for oneshot processing.
+	docLogger.Info("Downloading document for oneshot processing")
+	_, inputBytes, _, err := app.Client.DownloadDocumentAsPDF(ctx, doc.ID, limitOcrPages, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to download document %d as PDF: %w", doc.ID, err)
+		return nil, fmt.Errorf("failed to download document %d for oneshot: %w", doc.ID, err)
 	}
 
-	if len(pdfBytes) == 0 {
-		return nil, fmt.Errorf("downloaded PDF for document %d is empty", doc.ID)
+	if len(inputBytes) == 0 {
+		return nil, fmt.Errorf("downloaded input for document %d is empty", doc.ID)
 	}
-	docLogger.Infof("Downloaded PDF (%d bytes), sending to %s for OCR + field extraction", len(pdfBytes), oneshotModel)
+
+	inputMIMEType, err := detectOneshotInputMIMEType(inputBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to detect oneshot MIME type for document %d: %w", doc.ID, err)
+	}
+
+	docLogger.Infof("Downloaded document input (%d bytes, mime=%s), sending to %s for OCR + field extraction", len(inputBytes), inputMIMEType, oneshotModel)
 
 	// Build custom fields XML if needed
 	var customFieldsXML string
@@ -313,12 +333,12 @@ func (app *App) generateOneshotSuggestion(
 	}
 
 	// Try primary model
-	responseText, err := callOneshotModel(ctx, client, oneshotModel, pdfBytes, prompt, docLogger)
+	responseText, err := callOneshotModel(ctx, client, oneshotModel, inputMIMEType, inputBytes, prompt, docLogger)
 	if err != nil {
 		// If permanent failure and backup model is configured, try backup
 		if isPermanentOneshotError(err) && oneshotBackupModel != "" {
 			docLogger.Warnf("Primary model %s failed permanently, trying backup model %s", oneshotModel, oneshotBackupModel)
-			responseText, err = callOneshotModel(ctx, client, oneshotBackupModel, pdfBytes, prompt, docLogger)
+			responseText, err = callOneshotModel(ctx, client, oneshotBackupModel, inputMIMEType, inputBytes, prompt, docLogger)
 		}
 		if err != nil {
 			return nil, err

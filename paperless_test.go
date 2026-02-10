@@ -623,3 +623,49 @@ func TestDownloadDocumentAsPDF(t *testing.T) {
 
 	// Testing with splitting=true would be more complex so we'll skip that for simplicity
 }
+
+func TestDownloadDocumentAsPDF_NonPDFOriginal_NoSplit(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.teardown()
+
+	documentID := 456
+	imageContent := []byte{
+		0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10,
+		'J', 'F', 'I', 'F', 0x00, 0x01, 0x01, 0x00,
+	}
+
+	downloadPath := fmt.Sprintf("/api/documents/%d/download/", documentID)
+	env.setMockResponse(downloadPath, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(imageContent)
+	})
+
+	ctx := context.Background()
+	pdfPaths, pdfData, totalPages, err := env.client.DownloadDocumentAsPDF(ctx, documentID, 0, false)
+	require.NoError(t, err)
+	assert.Empty(t, pdfPaths, "No paths should be returned when split=false")
+	assert.Equal(t, imageContent, pdfData, "Original bytes should be returned even when not PDF")
+	assert.Equal(t, 1, totalPages, "Non-PDF originals should use fallback page count")
+}
+
+func TestDownloadDocumentAsPDF_NonPDFOriginal_WithSplitFails(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.teardown()
+
+	documentID := 789
+	imageContent := []byte{
+		0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10,
+		'J', 'F', 'I', 'F', 0x00, 0x01, 0x01, 0x00,
+	}
+
+	downloadPath := fmt.Sprintf("/api/documents/%d/download/", documentID)
+	env.setMockResponse(downloadPath, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(imageContent)
+	})
+
+	ctx := context.Background()
+	_, _, _, err := env.client.DownloadDocumentAsPDF(ctx, documentID, 0, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "error splitting PDF")
+}

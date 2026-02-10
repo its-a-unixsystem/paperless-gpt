@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"testing"
 	"text/template"
 
@@ -187,6 +188,42 @@ func TestExtractOneshotTextFromResponse(t *testing.T) {
 		text, err := extractOneshotTextFromResponse(resp, "model", 123, docLogger)
 		assert.NoError(t, err)
 		assert.Equal(t, "{\"ok\":true}", text)
+	})
+}
+
+func TestDetectOneshotInputMIMEType(t *testing.T) {
+	t.Run("detects pdf", func(t *testing.T) {
+		pdfBytes, err := os.ReadFile("tests/pdf/sample.pdf")
+		require.NoError(t, err)
+
+		mimeType, err := detectOneshotInputMIMEType(pdfBytes)
+		require.NoError(t, err)
+		assert.Equal(t, "application/pdf", mimeType)
+	})
+
+	t.Run("detects image jpeg", func(t *testing.T) {
+		jpegBytes := []byte{
+			0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10,
+			'J', 'F', 'I', 'F', 0x00, 0x01, 0x01, 0x00,
+		}
+
+		mimeType, err := detectOneshotInputMIMEType(jpegBytes)
+		require.NoError(t, err)
+		assert.Equal(t, "image/jpeg", mimeType)
+	})
+
+	t.Run("rejects unsupported mime", func(t *testing.T) {
+		mimeType, err := detectOneshotInputMIMEType([]byte("plain text data"))
+		assert.Empty(t, mimeType)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported oneshot document MIME type")
+	})
+
+	t.Run("rejects empty input", func(t *testing.T) {
+		mimeType, err := detectOneshotInputMIMEType(nil)
+		assert.Empty(t, mimeType)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "oneshot input is empty")
 	})
 }
 

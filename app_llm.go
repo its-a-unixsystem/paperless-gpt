@@ -516,7 +516,7 @@ func (app *App) generateDocumentSuggestions(ctx context.Context, suggestionReque
 
 			// Oneshot mode: single multimodal call extracts all fields
 			if suggestionRequest.Oneshot {
-				docLogger.Infof("Oneshot mode: sending PDF directly to %s for OCR + field extraction in a single call", oneshotModel)
+				docLogger.Infof("Oneshot mode: sending document directly to %s for OCR + field extraction in a single call", oneshotModel)
 				suggestion, oneshotErr := app.generateOneshotSuggestion(
 					ctx, doc, suggestionRequest,
 					availableTagNames, availableCorrespondentNames, availableDocumentTypeNames,
