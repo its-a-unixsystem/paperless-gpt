@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 
@@ -184,8 +185,48 @@ func TestGetAllTags(t *testing.T) {
 	assert.Equal(t, expectedTags, tags)
 }
 
-// TestGetDocumentsByTags tests the GetDocumentsByTags method
-func TestGetDocumentsByTags(t *testing.T) {
+// TestGetDocumentCountByTag tests the GetDocumentCountByTag method
+func TestGetDocumentCountByTag(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.teardown()
+
+	// Mock data for paginated responses
+	data1 := map[string]interface{}{
+		"count": 1,
+		"results": []map[string]interface{}{
+			{"document_count": 5},
+		},
+	}
+
+	data2 := map[string]interface{}{
+		"count":   0,
+		"results": []map[string]interface{}{},
+	}
+
+	// Set mock responses for pagination
+	env.setMockResponse("/api/tags/", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("name__iexact")
+		if query == "available" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(data1)
+		} else {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(data2)
+		}
+	})
+
+	ctx := context.Background()
+	countAvailable, err := env.client.GetDocumentCountByTag(ctx, "available")
+	require.NoError(t, err)
+	assert.Equal(t, 5, countAvailable)
+
+	countNotAvailable, err := env.client.GetDocumentCountByTag(ctx, "notavailable")
+	require.NoError(t, err)
+	assert.Equal(t, 0, countNotAvailable)
+}
+
+// TestGetDocumentsByTag tests the GetDocumentsByTag method
+func TestGetDocumentsByTag(t *testing.T) {
 	env := newTestEnv(t)
 	defer env.teardown()
 
@@ -221,23 +262,38 @@ func TestGetDocumentsByTags(t *testing.T) {
 		"next": nil,
 	}
 
+	// Mock data for tags
+	tagsExactResponse := map[string]interface{}{
+		"results": []map[string]interface{}{
+			{"document_count": 2},
+		},
+		"count": 1,
+	}
+
 	// Set mock responses
 	env.setMockResponse("/api/documents/", func(w http.ResponseWriter, r *http.Request) {
 		// Verify query parameters
-		expectedQuery := "tags__name__iexact=tag1&tags__name__iexact=tag2&page_size=25"
+		expectedQuery := "tags__name__iexact=tag2&page_size=25"
 		assert.Equal(t, expectedQuery, r.URL.RawQuery)
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(documentsResponse)
 	})
 
 	env.setMockResponse("/api/tags/", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(tagsResponse)
+		// Handle GetDocumentCountByTag call
+		if nameFilter := r.URL.Query().Get("name__iexact"); nameFilter != "" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(tagsExactResponse)
+		} else {
+			// Handle GetAllTags call
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(tagsResponse)
+		}
 	})
 
 	ctx := context.Background()
-	tags := []string{"tag1", "tag2"}
-	documents, err := env.client.GetDocumentsByTags(ctx, tags, 25)
+	tag := "tag2"
+	documents, err := env.client.GetDocumentsByTag(ctx, tag, 25)
 	require.NoError(t, err)
 
 	expectedDocuments := []Document{
@@ -256,6 +312,83 @@ func TestGetDocumentsByTags(t *testing.T) {
 			Tags:          []string{"tag2", "tag3"},
 			Correspondent: "Beta",
 			CreatedDate:   "1999-09-02",
+		},
+	}
+
+	assert.Equal(t, expectedDocuments, documents)
+}
+
+// TestGetDocumentsByTagWithEmoji tests the GetDocumentsByTag method with emoji and special characters
+func TestGetDocumentsByTagWithEmoji(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.teardown()
+
+	// Mock data for documents
+	documentsResponse := GetDocumentsApiResponse{
+		Results: []GetDocumentApiResponseResult{
+			{
+				ID:            1,
+				Title:         "AI Document",
+				Content:       "Content about AI",
+				Tags:          []int{1},
+				Correspondent: 1,
+				CreatedDate:   "2024-01-01",
+			},
+		},
+	}
+
+	// Mock data for tags
+	tagsResponse := map[string]interface{}{
+		"results": []map[string]interface{}{
+			{"id": 1, "name": "🤖 AI-Queue"},
+		},
+		"next": nil,
+	}
+
+	// Mock data for exact tag match
+	tagsExactResponse := map[string]interface{}{
+		"results": []map[string]interface{}{
+			{"document_count": 1},
+		},
+		"count": 1,
+	}
+
+	// Set mock responses
+	env.setMockResponse("/api/documents/", func(w http.ResponseWriter, r *http.Request) {
+		// Verify query parameters - the tag should be URL-encoded
+		expectedQuery := fmt.Sprintf("tags__name__iexact=%s&page_size=25", url.QueryEscape("🤖 AI-Queue"))
+		assert.Equal(t, expectedQuery, r.URL.RawQuery)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(documentsResponse)
+	})
+
+	env.setMockResponse("/api/tags/", func(w http.ResponseWriter, r *http.Request) {
+		// Handle GetDocumentCountByTag call
+		if nameFilter := r.URL.Query().Get("name__iexact"); nameFilter != "" {
+			// Verify the decoded value matches our emoji tag
+			assert.Equal(t, "🤖 AI-Queue", nameFilter)
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(tagsExactResponse)
+		} else {
+			// Handle GetAllTags call
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(tagsResponse)
+		}
+	})
+
+	ctx := context.Background()
+	tag := "🤖 AI-Queue"
+	documents, err := env.client.GetDocumentsByTag(ctx, tag, 25)
+	require.NoError(t, err)
+
+	expectedDocuments := []Document{
+		{
+			ID:            1,
+			Title:         "AI Document",
+			Content:       "Content about AI",
+			Tags:          []string{"🤖 AI-Queue"},
+			Correspondent: "Alpha",
+			CreatedDate:   "2024-01-01",
 		},
 	}
 
